@@ -19,17 +19,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <arpa/inet.h>
 
 #include "functions.h"
 
 #define FF_MAGIC "farbfeld"
 
-
-/* using rob pike's byte order fallacy blog post */
-static uint32_t
-ffstol(uint8_t *data)
+pixman_image_t *
+badread(const char *msg)
 {
-	return (data[3]<<0) | (data[2]<<8) | (data[1]<<16) | (data[0]<<24);
+	debug(msg);
+	return NULL;
 }
 
 pixman_image_t *
@@ -43,22 +43,23 @@ load_farbfeld(FILE *fp)
 
 	/* the farbfeld header is 16 bytes long */
 	buf = xmalloc(8*sizeof(uint8_t));
-	fread(buf, sizeof(uint8_t), 8, fp);
-	if (memcmp(FF_MAGIC, (uint8_t *) buf, 8) != 0) {
-		debug("invalid farbfeld magic\n");
-		return NULL;
-	}
-	fread(buf, sizeof(uint8_t), 8, fp);
-	width = ffstol(buf);
-	height = ffstol(buf+4);
+	if ((fread(buf, sizeof(uint8_t), 8, fp) != 8)
+	   || (memcmp(FF_MAGIC, (uint8_t *) buf, 8) != 0))
+		return badread("invalid farbfeld magic.\n");
+
+	if (fread(buf, sizeof(uint8_t), 8, fp) != 8)
+		return badread("could not read file.\n");
+
+	width = ntohl(((uint32_t *) buf)[0]);
+	height = ntohl(((uint32_t *) (buf))[1]);
 
 	/* now comes the pixels */
-	SAFE_MUL3(len, height, width, sizeof(*pixels));
+	SAFE_MUL3(len, height, width, sizeof(*pixel));
 	pixel = pixels = xmalloc(len);
 
 	/* here we naively convert to 8-bit per channel argb while reading */
-	while (feof(fp) == 0) {
-		fread(buf, sizeof(uint8_t), 8, fp);
+	while ((feof(fp) == 0)
+		    && (fread(buf, sizeof(uint8_t), 8, fp) == 8)) {
 		r = buf[0];
 		g = buf[2];
 		b = buf[4];
