@@ -19,53 +19,65 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <arpa/inet.h>
 
 #include "functions.h"
 
 #define FF_MAGIC "farbfeld"
 
-
-/* using rob pike's byte order fallacy blog post */
-static uint32_t
-ffstol(uint8_t *data)
+/* read and convert 16-bit channel to 8-bit channel */
+static uint8_t
+getffchannel(uint16_t n16)
 {
-	return (data[3]<<0) | (data[2]<<8) | (data[1]<<16) | (data[0]<<24);
+	return UINT8_MAX * ntohs(n16) / UINT16_MAX; 
 }
 
 pixman_image_t *
 load_farbfeld(FILE *fp)
 {
 	pixman_image_t *img;
-	uint8_t *buf;
-	uint8_t a, r, g, b;
-	uint32_t *pixels, *pixel, width, height;
+	uint8_t *buf, a, r, g, b;
+	uint16_t *c;
+	uint32_t *pixels, *pixel, width, height, pcount;
 	size_t len;
 
 	/* the farbfeld header is 16 bytes long */
+	/* the magic number is in the first 8 bytes */
 	buf = xmalloc(8*sizeof(uint8_t));
-	fread(buf, sizeof(uint8_t), 8, fp);
+	if (fread(buf, sizeof(uint8_t), 8, fp) != 8)
+		errx(1, "failed to read farbfeld magic");
 	if (memcmp(FF_MAGIC, (uint8_t *) buf, 8) != 0) {
 		debug("invalid farbfeld magic\n");
 		return NULL;
 	}
-	fread(buf, sizeof(uint8_t), 8, fp);
-	width = ffstol(buf);
-	height = ffstol(buf+4);
+	/* and the picture dimensions are the next 8 bytes */
+	if (fread(buf, sizeof(uint8_t), 8, fp) != 8)
+		errx(1, "failed to read farbfeld dimensions");
+	width = ntohl(((uint32_t *) buf)[0]);
+	height = ntohl(((uint32_t *) buf)[1]);
+	pcount = width * height;
+	debug("farbfeld dimensions: %lu x %lu\n", width, height);
 
 	/* now comes the pixels */
-	SAFE_MUL3(len, height, width, sizeof(*pixels));
+	SAFE_MUL3(len, height, width, sizeof(*pixel));
 	pixel = pixels = xmalloc(len);
 
-	/* here we naively convert to 8-bit per channel argb while reading */
-	while (feof(fp) == 0) {
-		fread(buf, sizeof(uint8_t), 8, fp);
-		r = buf[0];
-		g = buf[2];
-		b = buf[4];
-		a = buf[6];
-		*pixel = (a<<24) | (r<<16) | (g<<8) | (b<<0);
+	/* build each pixel and write to pixels buffer */
+	while (fread(buf, sizeof(uint16_t), 4, fp) == 4) {
+		c = (uint16_t *) buf;
+		r = getffchannel(c[0]);
+		g = getffchannel(c[1]);
+		b = getffchannel(c[2]);
+		a = getffchannel(c[3]);
+		uint8_t c8[] = {a, r, g, b};
+		*pixel = htonl(*((uint32_t *) c8));
 		pixel++;
+		pcount--;
 	}
+	/* check if loop exited on error */
+	if (!feof(fp) || ferror(fp) || pcount > 0)
+		errx(1, "read error with %d pixels remaining", pcount);
+
 	free(buf);
 
 	img = pixman_image_create_bits(PIXMAN_a8r8g8b8, width, height, pixels,
