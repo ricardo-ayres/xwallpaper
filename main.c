@@ -36,6 +36,10 @@
 
 #define MAXIMUM(x, y) ((x) > (y) ? (x) : (y))
 
+#ifdef WITH_RANDR
+xcb_pixmap_t created_pixmap = XCB_BACK_PIXMAP_NONE;
+#endif /* WITH_RANDR */
+
 static uint32_t
 get_max_rows_per_request(xcb_connection_t *c, xcb_image_t *image, uint32_t n)
 {
@@ -497,7 +501,7 @@ process_atoms(xcb_connection_t *c, xcb_screen_t *screen, xcb_pixmap_t *pixmap,
 {
 	static xcb_void_cookie_t (*delete)(xcb_connection_t *, uint32_t) =
 	    xcb_kill_client;
-	int i;
+	int deleted, i;
 	xcb_intern_atom_cookie_t atom_cookie[2];
 	xcb_intern_atom_reply_t *atom_reply[2];
 	xcb_get_property_cookie_t property_cookie[2];
@@ -531,11 +535,16 @@ process_atoms(xcb_connection_t *c, xcb_screen_t *screen, xcb_pixmap_t *pixmap,
 			old[i] = NULL;
 	}
 
-	if (old[0] != NULL && pixmap != NULL && *old[0] != *pixmap)
+	deleted = 0;
+	if (old[0] != NULL && pixmap != NULL && *old[0] != *pixmap) {
 		delete(c, *old[0]);
-	if (old[1] != NULL && (old[0] == NULL || *old[0] != *old[1]))
+		deleted = 1;
+	}
+	if (old[1] != NULL && (old[0] == NULL || *old[0] != *old[1])) {
 		delete(c, *old[1]);
-	if (pixmap != NULL)
+		deleted = 1;
+	}
+	if (deleted)
 		delete = xcb_free_pixmap;
 
 	if (old_pixmap != NULL) {
@@ -578,9 +587,8 @@ process_screen(xcb_connection_t *c, xcb_screen_t *screen, int snum,
 	wp_option_t *opt, *options;
 	uint16_t width, height;
 	xcb_rectangle_t rectangle;
-	int reuse;
+	int created;
 
-	reuse = 0;
 	options = config->options;
 
 	/* let X perform non-randr tiling if requested */
@@ -612,8 +620,6 @@ process_screen(xcb_connection_t *c, xcb_screen_t *screen, int snum,
 			    geom_reply->height != height ||
 			    geom_reply->depth != screen->root_depth)
 				pixmap = XCB_BACK_PIXMAP_NONE;
-			else
-				reuse = 1;
 			free(geom_reply);
 		}
 	} else
@@ -622,6 +628,11 @@ process_screen(xcb_connection_t *c, xcb_screen_t *screen, int snum,
 	if (pixmap == XCB_BACK_PIXMAP_NONE) {
 		debug("creating pixmap (%dx%d)\n", width, height);
 		pixmap = xcb_generate_id(c);
+#ifdef WITH_RANDR
+		if (config->daemon && (config->target & TARGET_ATOMS) &&
+		    !xcb_connection_has_error(c))
+			created_pixmap = pixmap;
+#endif /* WITH_RANDR */
 		xcb_create_pixmap(c, screen->root_depth, pixmap, screen->root,
 		    width, height);
 		gc = xcb_generate_id(c);
@@ -631,10 +642,12 @@ process_screen(xcb_connection_t *c, xcb_screen_t *screen, int snum,
 		rectangle.width = width;
 		rectangle.height = height;
 		xcb_poly_fill_rectangle(c, pixmap, gc, 1, &rectangle);
+		created = 1;
 	} else {
 		debug("reusing atom pixmap (%dx%d)\n", width, height);
 		gc = xcb_generate_id(c);
 		xcb_create_gc(c, gc, pixmap, 0, NULL);
+		created = 0;
 	}
 
 	for (opt = options; opt != NULL && opt->filename != NULL; opt++) {
@@ -675,9 +688,9 @@ process_screen(xcb_connection_t *c, xcb_screen_t *screen, int snum,
 	}
 	if (config->target & TARGET_ATOMS) {
 		process_atoms(c, screen, &result, NULL);
-		if (!reuse)
-			xcb_kill_client(c, XCB_KILL_ALL_TEMPORARY);
-		xcb_set_close_down_mode(c, XCB_CLOSE_DOWN_RETAIN_TEMPORARY);
+		if (created)
+			xcb_set_close_down_mode(c,
+			    XCB_CLOSE_DOWN_RETAIN_PERMANENT);
 	} else
 		xcb_free_pixmap(c, pixmap);
 	xcb_request_check(c, xcb_clear_area(c, 0, screen->root, 0, 0, 0, 0));
@@ -717,8 +730,6 @@ process_event(wp_config_t *config, xcb_connection_t *c,
 			process_screen(c, it.data, snum, config);
 		}
 	}
-	xcb_request_check(c, xcb_set_close_down_mode(c,
-	    XCB_CLOSE_DOWN_RETAIN_PERMANENT));
 	if (xcb_connection_has_error(c))
 		warnx("error encountered while setting wallpaper");
 }
@@ -729,6 +740,9 @@ main(int argc, char *argv[])
 {
 	wp_config_t *config;
 	xcb_connection_t *c;
+#ifdef WITH_RANDR
+	xcb_connection_t *c2;
+#endif /* WITH_RANDR */
 	xcb_generic_event_t *event;
 	xcb_screen_iterator_t it;
 	int snum;
@@ -748,6 +762,13 @@ main(int argc, char *argv[])
 	c = xcb_connect(NULL, NULL);
 	if (xcb_connection_has_error(c))
 		errx(1, "failed to connect to X server");
+#ifdef WITH_RANDR
+	if (config->daemon) {
+		c2 = xcb_connect(NULL, NULL);
+		if (xcb_connection_has_error(c2))
+			errx(1, "failed to connect to X server for clean up");
+	}
+#endif /* WITH_RANDR */
 #ifdef HAVE_PLEDGE
 	if (pledge("stdio", NULL) == -1)
 		err(1, "pledge");
@@ -788,6 +809,19 @@ main(int argc, char *argv[])
 #endif /* WITH_RANDR */
 
 	xcb_disconnect(c);
+
+#ifdef WITH_RANDR
+	if (config->daemon) {
+		if (created_pixmap != XCB_BACK_PIXMAP_NONE) {
+			debug("killing X client\n");
+			xcb_request_check(c2,
+			    xcb_kill_client(c2, created_pixmap));
+		}
+		if (xcb_connection_has_error(c2))
+			debug("failed to kill X client\n");
+		xcb_disconnect(c2);
+	}
+#endif /* WITH_RANDR */
 
 	return 0;
 }
